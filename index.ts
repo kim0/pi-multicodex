@@ -344,20 +344,6 @@ export class AccountManager {
 export default function multicodexExtension(pi: ExtensionAPI) {
 	const accountManager = new AccountManager();
 
-	const updateStatus = (ctx: ExtensionContext): void => {
-		const active = accountManager.getActiveAccount();
-		if (!active) {
-			ctx.ui.setStatus(PROVIDER_ID, "No account");
-			return;
-		}
-
-		const status =
-			active.quotaExhaustedUntil && active.quotaExhaustedUntil > Date.now()
-				? `${active.email} (Quota Hit)`
-				: active.email;
-		ctx.ui.setStatus(PROVIDER_ID, status);
-	};
-
 	// Provider registration
 	pi.registerProvider(PROVIDER_ID, {
 		baseUrl: "https://chatgpt.com/backend-api/codex",
@@ -419,7 +405,6 @@ export default function multicodexExtension(pi: ExtensionAPI) {
 
 				accountManager.addOrUpdateAccount(email, creds);
 				ctx.ui.notify(`Successfully logged in as ${email}`, "info");
-				updateStatus(ctx);
 			} catch (e) {
 				ctx.ui.notify(`Login failed: ${getErrorMessage(e)}`, "error");
 			}
@@ -454,7 +439,6 @@ export default function multicodexExtension(pi: ExtensionAPI) {
 
 			const email = selected.split(" ")[0];
 			accountManager.setActiveAccount(email);
-			updateStatus(ctx);
 			ctx.ui.notify(`Switched to ${email}`, "info");
 		},
 	});
@@ -492,22 +476,20 @@ export default function multicodexExtension(pi: ExtensionAPI) {
 	});
 
 	// Hooks
-	pi.on("session_start", (_event: unknown, ctx: ExtensionContext) => {
+	pi.on("session_start", (_event: unknown, _ctx: ExtensionContext) => {
 		if (
 			!accountManager.getActiveAccount() &&
 			accountManager.getAccounts().length > 0
 		) {
 			accountManager.rotateRandomly();
 		}
-		updateStatus(ctx);
 	});
 
 	pi.on(
 		"session_switch",
-		(event: { reason?: string }, ctx: ExtensionContext) => {
+		(event: { reason?: string }, _ctx: ExtensionContext) => {
 			if (event.reason === "new") {
 				accountManager.rotateRandomly();
-				updateStatus(ctx);
 			}
 		},
 	);
