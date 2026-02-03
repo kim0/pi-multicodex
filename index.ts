@@ -18,12 +18,14 @@ import {
 	type AssistantMessageEvent,
 	type AssistantMessageEventStream,
 	type Context,
+	createAssistantMessageEventStream,
+	getApiProvider,
+	getModels,
 	loginOpenAICodex,
 	type Model,
 	type OAuthCredentials,
 	refreshOpenAICodexToken,
 	type SimpleStreamOptions,
-	streamSimple,
 } from "@mariozechner/pi-ai";
 import type {
 	ExtensionAPI,
@@ -34,92 +36,6 @@ import type {
 // =============================================================================
 // Helpers
 // =============================================================================
-
-class LocalEventStream<T, R = T> implements AsyncIterable<T> {
-	private queue: T[] = [];
-	private waiting: ((value: IteratorResult<T>) => void)[] = [];
-	private done = false;
-	private finalResultPromise: Promise<R>;
-	private resolveFinalResult!: (result: R) => void;
-
-	constructor(
-		private isComplete: (event: T) => boolean,
-		private extractResult: (event: T) => R,
-	) {
-		this.finalResultPromise = new Promise((resolve) => {
-			this.resolveFinalResult = resolve;
-		});
-	}
-
-	push(event: T): void {
-		if (this.done) return;
-
-		if (this.isComplete(event)) {
-			this.done = true;
-			this.resolveFinalResult(this.extractResult(event));
-		}
-
-		const waiter = this.waiting.shift();
-		if (waiter) {
-			waiter({ value: event, done: false });
-		} else {
-			this.queue.push(event);
-		}
-	}
-
-	end(result?: R): void {
-		this.done = true;
-		if (result !== undefined) {
-			this.resolveFinalResult(result);
-		}
-		while (this.waiting.length > 0) {
-			const waiter = this.waiting.shift();
-			if (waiter) {
-				waiter({ value: undefined as never, done: true });
-			}
-		}
-	}
-
-	async *[Symbol.asyncIterator](): AsyncIterator<T> {
-		while (true) {
-			if (this.queue.length > 0) {
-				const next = this.queue.shift();
-				if (!next) {
-					continue;
-				}
-				yield next;
-			} else if (this.done) {
-				return;
-			} else {
-				const result = await new Promise<IteratorResult<T>>((resolve) =>
-					this.waiting.push(resolve),
-				);
-				if (result.done) return;
-				yield result.value;
-			}
-		}
-	}
-
-	result(): Promise<R> {
-		return this.finalResultPromise;
-	}
-}
-
-class LocalAssistantMessageEventStream extends LocalEventStream<
-	AssistantMessageEvent,
-	AssistantMessage
-> {
-	constructor() {
-		super(
-			(event) => event.type === "done" || event.type === "error",
-			(event) => {
-				if (event.type === "done") return event.message;
-				if (event.type === "error") return event.error;
-				throw new Error("Unexpected event type");
-			},
-		);
-	}
-}
 
 export function isQuotaErrorMessage(message: string): boolean {
 	return /\b429\b|quota|usage limit|rate.?limit|too many requests|limit reached/i.test(
@@ -154,6 +70,66 @@ function createErrorAssistantMessage(
 		errorMessage: message,
 		timestamp: Date.now(),
 	};
+}
+
+export interface ProviderModelDef {
+	id: string;
+	name: string;
+	reasoning: boolean;
+	input: ("text" | "image")[];
+	cost: {
+		input: number;
+		output: number;
+		cacheRead: number;
+		cacheWrite: number;
+	};
+	contextWindow: number;
+	maxTokens: number;
+}
+
+export function getOpenAICodexMirror(): {
+	baseUrl: string;
+	models: ProviderModelDef[];
+} {
+	const sourceModels = getModels("openai-codex");
+	return {
+		baseUrl: sourceModels[0]?.baseUrl || "https://chatgpt.com/backend-api",
+		models: sourceModels.map((m) => ({
+			id: m.id,
+			name: m.name,
+			reasoning: m.reasoning,
+			input: m.input,
+			cost: m.cost,
+			contextWindow: m.contextWindow,
+			maxTokens: m.maxTokens,
+		})),
+	};
+}
+
+function createLinkedAbortController(signal?: AbortSignal): AbortController {
+	const controller = new AbortController();
+	if (signal?.aborted) {
+		controller.abort();
+		return controller;
+	}
+	signal?.addEventListener("abort", () => controller.abort(), { once: true });
+	return controller;
+}
+
+function withProvider(
+	event: AssistantMessageEvent,
+	provider: string,
+): AssistantMessageEvent {
+	if ("partial" in event) {
+		return { ...event, partial: { ...event.partial, provider } };
+	}
+	if (event.type === "done") {
+		return { ...event, message: { ...event.message, provider } };
+	}
+	if (event.type === "error") {
+		return { ...event, error: { ...event.error, provider } };
+	}
+	return event;
 }
 
 async function openLoginInBrowser(
@@ -341,36 +317,42 @@ export class AccountManager {
 // Extension Entry Point
 // =============================================================================
 
+type ApiProviderRef = NonNullable<ReturnType<typeof getApiProvider>>;
+
+export function buildMulticodexProviderConfig(accountManager: AccountManager): {
+	baseUrl: string;
+	apiKey: string;
+	api: "openai-codex-responses";
+	streamSimple: (
+		model: Model<Api>,
+		context: Context,
+		options?: SimpleStreamOptions,
+	) => AssistantMessageEventStream;
+	models: ProviderModelDef[];
+} {
+	const mirror = getOpenAICodexMirror();
+	const baseProvider = getApiProvider("openai-codex-responses");
+	if (!baseProvider) {
+		throw new Error(
+			"OpenAI Codex provider not available. Please update pi to include openai-codex support.",
+		);
+	}
+	return {
+		baseUrl: mirror.baseUrl,
+		apiKey: "managed-by-extension",
+		api: "openai-codex-responses",
+		streamSimple: createStreamWrapper(accountManager, baseProvider),
+		models: mirror.models,
+	};
+}
+
 export default function multicodexExtension(pi: ExtensionAPI) {
 	const accountManager = new AccountManager();
 
-	// Provider registration
-	pi.registerProvider(PROVIDER_ID, {
-		baseUrl: "https://chatgpt.com/backend-api/codex",
-		apiKey: "managed-by-extension",
-		api: "openai-codex-responses",
-		streamSimple: createStreamWrapper(accountManager),
-		models: [
-			{
-				id: `${PROVIDER_ID}/gpt-5.2-codex`,
-				name: "Multi-Codex GPT-5.2",
-				reasoning: true,
-				input: ["text"],
-				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-				contextWindow: 128000,
-				maxTokens: 16384,
-			},
-			{
-				id: `${PROVIDER_ID}/gpt-5.1-codex-mini`,
-				name: "Multi-Codex GPT-5.1 Mini",
-				reasoning: true,
-				input: ["text"],
-				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-				contextWindow: 128000,
-				maxTokens: 16384,
-			},
-		],
-	});
+	pi.registerProvider(
+		PROVIDER_ID,
+		buildMulticodexProviderConfig(accountManager),
+	);
 
 	// Login command
 	pi.registerCommand("multicodex-login", {
@@ -501,14 +483,16 @@ export default function multicodexExtension(pi: ExtensionAPI) {
 
 const MAX_ROTATION_RETRIES = 5;
 
-export function createStreamWrapper(accountManager: AccountManager) {
+export function createStreamWrapper(
+	accountManager: AccountManager,
+	baseProvider: ApiProviderRef,
+) {
 	return (
 		model: Model<Api>,
 		context: Context,
 		options?: SimpleStreamOptions,
 	): AssistantMessageEventStream => {
-		const stream =
-			new LocalAssistantMessageEventStream() as unknown as AssistantMessageEventStream;
+		const stream = createAssistantMessageEventStream();
 
 		(async () => {
 			try {
@@ -522,16 +506,15 @@ export function createStreamWrapper(accountManager: AccountManager) {
 
 					const token = await accountManager.ensureValidToken(account);
 
+					const abortController = createLinkedAbortController(options?.signal);
+
 					const internalModel: Model<"openai-codex-responses"> = {
 						...(model as Model<"openai-codex-responses">),
-						id: model.id.includes("gpt-5.1")
-							? "gpt-5.1-codex-mini"
-							: "gpt-5.2-codex",
+						provider: "openai-codex",
 						api: "openai-codex-responses",
-						provider: model.provider,
 					};
 
-					const inner = streamSimple(
+					const inner = baseProvider.streamSimple(
 						{
 							...internalModel,
 							headers: {
@@ -543,6 +526,7 @@ export function createStreamWrapper(accountManager: AccountManager) {
 						{
 							...options,
 							apiKey: token,
+							signal: abortController.signal,
 						},
 					);
 
@@ -557,17 +541,18 @@ export function createStreamWrapper(accountManager: AccountManager) {
 							if (isQuota && !forwardedAny && attempt < MAX_ROTATION_RETRIES) {
 								accountManager.markExhausted(account.email);
 								accountManager.rotateRandomly();
+								abortController.abort();
 								retry = true;
 								break;
 							}
 
-							stream.push(event);
+							stream.push(withProvider(event, model.provider));
 							stream.end();
 							return;
 						}
 
 						forwardedAny = true;
-						stream.push(event);
+						stream.push(withProvider(event, model.provider));
 
 						if (event.type === "done") {
 							stream.end();
@@ -593,7 +578,7 @@ export function createStreamWrapper(accountManager: AccountManager) {
 						`Multicodex failed: ${message}`,
 					),
 				};
-				stream.push(errorEvent);
+				stream.push(withProvider(errorEvent, model.provider));
 				stream.end();
 			}
 		})();
