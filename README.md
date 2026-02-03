@@ -38,6 +38,8 @@ pi
 - This extension only uses public exports from `@mariozechner/pi-ai` and `@mariozechner/pi-coding-agent`.
 - Streaming uses `streamSimple()` and a local event stream implementation to avoid deep imports.
 - The local `pi-coding-agent.d.ts` module augmentation is for local typechecking only. It should be kept small and aligned with the real runtime surface.
+- Login attempts to open the browser automatically using the platform default handler.
+- Status is integrated into the main footer line (no extra status row).
 
 ## Checks
 

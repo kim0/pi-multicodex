@@ -1,5 +1,6 @@
 import type {
 	Api,
+	AssistantMessage,
 	AssistantMessageEventStream,
 	Context,
 	Model,
@@ -15,7 +16,21 @@ declare module "@mariozechner/pi-coding-agent" {
 
 	export interface ExtensionUI {
 		notify(message: string, level: UiNotifyLevel): void;
-		setStatus(key: string, value: string): void;
+		setFooter(
+			factory?: (
+				tui: { requestRender(): void },
+				theme: { fg(token: string, text: string): string },
+				footerData: {
+					getGitBranch(): string | null;
+					getAvailableProviderCount(): number;
+					onBranchChange?(callback: () => void): () => void;
+				},
+			) => {
+				render(width: number): string[];
+				invalidate(): void;
+				dispose?(): void;
+			},
+		): void;
 		input(prompt: string): Promise<string | undefined>;
 		select(title: string, options: string[]): Promise<string | undefined>;
 		confirm(title: string, message: string): Promise<boolean>;
@@ -23,11 +38,34 @@ declare module "@mariozechner/pi-coding-agent" {
 
 	export interface ExtensionContext {
 		ui: ExtensionUI;
+		sessionManager: {
+			getEntries(): Array<
+				| { type: "message"; message: AssistantMessage }
+				| { type: string; message?: unknown }
+			>;
+			getSessionName(): string | undefined;
+		};
+		model?: Model<Api>;
+		thinkingLevel?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
 	}
 
 	export interface ExtensionCommandContext extends ExtensionContext {}
 
 	export interface ExtensionAPI {
+		exec(
+			command: string,
+			args: string[],
+			options?: {
+				cwd?: string;
+				env?: Record<string, string>;
+				timeout?: number;
+			},
+		): Promise<{
+			stdout: string;
+			stderr: string;
+			code: number | null;
+			killed: boolean;
+		}>;
 		registerProvider(
 			name: string,
 			config: {
