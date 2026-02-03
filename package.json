@@ -1,0 +1,44 @@
+{
+	"name": "pi-extension-multicodex",
+	"version": "1.0.0",
+	"description": "Rotate multiple ChatGPT Codex OAuth accounts for pi",
+	"license": "MIT",
+	"type": "module",
+	"main": "index.ts",
+	"keywords": [
+		"pi-package"
+	],
+	"pi": {
+		"extensions": [
+			"./index.ts"
+		]
+	},
+	"files": [
+		"index.ts",
+		"pi-coding-agent.d.ts",
+		"README.md",
+		"AGENTS.md",
+		"index.test.ts",
+		"vitest.config.ts",
+		"tsconfig.json",
+		"biome.json"
+	],
+	"scripts": {
+		"lint": "biome check .",
+		"test": "vitest run -c vitest.config.ts",
+		"tsgo": "tsgo -p tsconfig.json"
+	},
+	"peerDependencies": {
+		"@mariozechner/pi-coding-agent": "*",
+		"@mariozechner/pi-ai": "*"
+	},
+	"devDependencies": {
+		"@mariozechner/pi-ai": "^0.51.2",
+		"@mariozechner/pi-coding-agent": "^0.51.2",
+		"@biomejs/biome": "^2.3.14",
+		"@types/node": "^22.0.0",
+		"@typescript/native-preview": "7.0.0-dev.20260203.1",
+		"typescript": "^5.9.3",
+		"vitest": "^4.0.18"
+	}
+}
