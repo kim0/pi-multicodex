@@ -200,6 +200,13 @@ function buildFooterLines(
 	theme: FooterTheme,
 	footerData: FooterData,
 	ctx: ExtensionContext,
+	getThinkingLevel: () =>
+		| "off"
+		| "minimal"
+		| "low"
+		| "medium"
+		| "high"
+		| "xhigh",
 	statusText?: string,
 ): string[] {
 	let totalInput = 0;
@@ -299,7 +306,7 @@ function buildFooterLines(
 	const modelName = ctx.model?.id || "no-model";
 	let rightSideWithoutProvider = modelName;
 	if (ctx.model?.reasoning) {
-		const thinkingLevel = ctx.thinkingLevel || "off";
+		const thinkingLevel = getThinkingLevel();
 		rightSideWithoutProvider =
 			thinkingLevel === "off"
 				? `${modelName} • thinking off`
@@ -561,6 +568,7 @@ export default function multicodexExtension(pi: ExtensionAPI) {
 						theme as FooterTheme,
 						footerData,
 						footerContext,
+						() => pi.getThinkingLevel(),
 						statusText,
 					);
 				},

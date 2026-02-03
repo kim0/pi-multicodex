@@ -46,12 +46,13 @@ declare module "@mariozechner/pi-coding-agent" {
 			getSessionName(): string | undefined;
 		};
 		model?: Model<Api>;
-		thinkingLevel?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
 	}
 
 	export interface ExtensionCommandContext extends ExtensionContext {}
 
 	export interface ExtensionAPI {
+		getThinkingLevel(): "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
+
 		exec(
 			command: string,
 			args: string[],
