@@ -81,7 +81,13 @@ function main() {
 		if (npmVersionExists(pkg.name, requested)) {
 			fail(`version ${requested} already exists on npm for ${pkg.name}`);
 		}
-		shInherit("npm", ["version", requested, "--no-git-tag-version"]);
+		if (requested === pkg.version) {
+			console.log(
+				"[publish] requested version equals package.json version; skipping npm version",
+			);
+		} else {
+			shInherit("npm", ["version", requested, "--no-git-tag-version"]);
+		}
 	} else {
 		// Default: patch bump based on package.json version
 		console.log("[publish] bumping patch version");
