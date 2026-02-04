@@ -4,6 +4,7 @@ import {
 	type Account,
 	type AccountManager,
 	buildMulticodexProviderConfig,
+	createStreamWrapper,
 	getNextResetAt,
 	getOpenAICodexMirror,
 	isQuotaErrorMessage,
@@ -79,6 +80,11 @@ function makeAccount(email: string, overrides?: Partial<Account>): Account {
 		...overrides,
 	};
 }
+
+type StreamWrapper = ReturnType<typeof createStreamWrapper>;
+type StreamModel = Parameters<StreamWrapper>[0];
+type StreamContext = Parameters<StreamWrapper>[1];
+type BaseProvider = Parameters<typeof createStreamWrapper>[1];
 
 describe("usage helpers", () => {
 	it("parses usage response windows", () => {
@@ -204,5 +210,171 @@ describe("pickBestAccount", () => {
 
 		const selected = pickBestAccount(accounts, usage, { now: 1000 });
 		expect(selected?.email).toBe("b");
+	});
+});
+
+describe("manual account selection", () => {
+	it("prefers the manual account in stream wrapper", async () => {
+		const manual = makeAccount("manual@example.com");
+		let activateCalled = false;
+		let headerEmail: string | undefined;
+
+		const accountManager = {
+			getAvailableManualAccount: () => manual,
+			hasManualAccount: () => true,
+			clearManualAccount: () => {},
+			activateBestAccount: async () => {
+				activateCalled = true;
+				return undefined;
+			},
+			ensureValidToken: async () => "manual-token",
+			handleQuotaExceeded: async () => {},
+		} as unknown as AccountManager;
+
+		const baseProvider = {
+			streamSimple: (
+				model: { headers?: Record<string, string> },
+				_context: unknown,
+				_options?: unknown,
+			) => {
+				headerEmail = model.headers?.["X-Multicodex-Account"];
+				async function* inner() {
+					yield { type: "done" };
+				}
+				return inner() as unknown as AsyncIterable<unknown>;
+			},
+		};
+
+		const stream = createStreamWrapper(
+			accountManager,
+			baseProvider as unknown as BaseProvider,
+		)(
+			{
+				id: "test",
+				provider: "multicodex",
+				api: "openai-codex-responses",
+			} as StreamModel,
+			{} as StreamContext,
+		);
+
+		for await (const _event of stream) {
+			// drain
+		}
+
+		expect(activateCalled).toBe(false);
+		expect(headerEmail).toBe("manual@example.com");
+	});
+
+	it("falls back to auto selection when manual is unavailable", async () => {
+		const auto = makeAccount("auto@example.com");
+		let cleared = false;
+		let headerEmail: string | undefined;
+
+		const accountManager = {
+			getAvailableManualAccount: () => undefined,
+			hasManualAccount: () => true,
+			clearManualAccount: () => {
+				cleared = true;
+			},
+			activateBestAccount: async () => auto,
+			ensureValidToken: async () => "auto-token",
+			handleQuotaExceeded: async () => {},
+		} as unknown as AccountManager;
+
+		const baseProvider = {
+			streamSimple: (
+				model: { headers?: Record<string, string> },
+				_context: unknown,
+				_options?: unknown,
+			) => {
+				headerEmail = model.headers?.["X-Multicodex-Account"];
+				async function* inner() {
+					yield { type: "done" };
+				}
+				return inner() as unknown as AsyncIterable<unknown>;
+			},
+		};
+
+		const stream = createStreamWrapper(
+			accountManager,
+			baseProvider as unknown as BaseProvider,
+		)(
+			{
+				id: "test",
+				provider: "multicodex",
+				api: "openai-codex-responses",
+			} as StreamModel,
+			{} as StreamContext,
+		);
+
+		for await (const _event of stream) {
+			// drain
+		}
+
+		expect(cleared).toBe(true);
+		expect(headerEmail).toBe("auto@example.com");
+	});
+
+	it("clears manual on quota and retries with auto account", async () => {
+		const manual = makeAccount("manual@example.com");
+		const auto = makeAccount("auto@example.com");
+		let cleared = false;
+		let activateCount = 0;
+		const headers: string[] = [];
+		let streamCalls = 0;
+
+		const accountManager = {
+			getAvailableManualAccount: () => (cleared ? undefined : manual),
+			hasManualAccount: () => !cleared,
+			clearManualAccount: () => {
+				cleared = true;
+			},
+			activateBestAccount: async () => {
+				activateCount += 1;
+				return auto;
+			},
+			ensureValidToken: async (account: Account) => `${account.email}-token`,
+			handleQuotaExceeded: async () => {},
+		} as unknown as AccountManager;
+
+		const baseProvider = {
+			streamSimple: (
+				model: { headers?: Record<string, string> },
+				_context: unknown,
+				_options?: unknown,
+			) => {
+				headers.push(model.headers?.["X-Multicodex-Account"] || "");
+				streamCalls += 1;
+				async function* inner() {
+					if (streamCalls === 1) {
+						yield { type: "error", error: { errorMessage: "quota exceeded" } };
+						return;
+					}
+					yield { type: "done" };
+				}
+				return inner() as unknown as AsyncIterable<unknown>;
+			},
+		};
+
+		const stream = createStreamWrapper(
+			accountManager,
+			baseProvider as unknown as BaseProvider,
+		)(
+			{
+				id: "test",
+				provider: "multicodex",
+				api: "openai-codex-responses",
+			} as StreamModel,
+			{} as StreamContext,
+		);
+
+		for await (const _event of stream) {
+			// drain
+		}
+
+		expect(cleared).toBe(true);
+		expect(headers[0]).toBe("manual@example.com");
+		expect(headers[1]).toBe("auto@example.com");
+		expect(activateCount).toBe(1);
 	});
 });

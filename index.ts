@@ -384,6 +384,7 @@ export class AccountManager {
 	private data: StorageData;
 	private usageCache = new Map<string, CodexUsageSnapshot>();
 	private warningHandler?: WarningHandler;
+	private manualEmail?: string;
 
 	constructor() {
 		this.data = this.load();
@@ -449,10 +450,39 @@ export class AccountManager {
 	}
 
 	getActiveAccount(): Account | undefined {
+		const manual = this.getManualAccount();
+		if (manual) return manual;
 		if (this.data.activeEmail) {
 			return this.getAccount(this.data.activeEmail);
 		}
 		return this.data.accounts[0];
+	}
+
+	getManualAccount(): Account | undefined {
+		if (!this.manualEmail) return undefined;
+		const account = this.getAccount(this.manualEmail);
+		if (!account) {
+			this.manualEmail = undefined;
+			return undefined;
+		}
+		return account;
+	}
+
+	hasManualAccount(): boolean {
+		return Boolean(this.getManualAccount());
+	}
+
+	getAvailableManualAccount(options?: {
+		now?: number;
+		excludeEmails?: Set<string>;
+	}): Account | undefined {
+		const now = options?.now ?? Date.now();
+		this.clearExpiredExhaustion(now);
+		const manual = this.getManualAccount();
+		if (!manual) return undefined;
+		if (options?.excludeEmails?.has(manual.email)) return undefined;
+		if (!isAccountAvailable(manual, now)) return undefined;
+		return manual;
 	}
 
 	setActiveAccount(email: string): void {
@@ -461,6 +491,17 @@ export class AccountManager {
 		this.data.activeEmail = email;
 		account.lastUsed = Date.now();
 		this.save();
+	}
+
+	setManualAccount(email: string): void {
+		const account = this.getAccount(email);
+		if (!account) return;
+		this.manualEmail = email;
+		account.lastUsed = Date.now();
+	}
+
+	clearManualAccount(): void {
+		this.manualEmail = undefined;
 	}
 
 	markExhausted(email: string, until: number): void {
@@ -689,7 +730,7 @@ export default function multicodexExtension(pi: ExtensionAPI) {
 
 	// Switch active account
 	pi.registerCommand("multicodex-use", {
-		description: "Switch active Codex account",
+		description: "Switch active Codex account for this session",
 		handler: async (
 			_args: string,
 			ctx: ExtensionCommandContext,
@@ -714,7 +755,7 @@ export default function multicodexExtension(pi: ExtensionAPI) {
 			if (!selected) return;
 
 			const email = selected.split(" ")[0];
-			accountManager.setActiveAccount(email);
+			accountManager.setManualAccount(email);
 			ctx.ui.notify(`Switched to ${email}`, "info");
 		},
 	});
@@ -775,6 +816,11 @@ export default function multicodexExtension(pi: ExtensionAPI) {
 		if (accountManager.getAccounts().length === 0) return;
 		void (async () => {
 			await accountManager.refreshUsageForAllAccounts({ force: true });
+			const manual = accountManager.getAvailableManualAccount();
+			if (manual) return;
+			if (accountManager.hasManualAccount()) {
+				accountManager.clearManualAccount();
+			}
 			await accountManager.activateBestAccount();
 		})();
 	});
@@ -786,6 +832,11 @@ export default function multicodexExtension(pi: ExtensionAPI) {
 			if (event.reason === "new") {
 				void (async () => {
 					await accountManager.refreshUsageForAllAccounts({ force: true });
+					const manual = accountManager.getAvailableManualAccount();
+					if (manual) return;
+					if (accountManager.hasManualAccount()) {
+						accountManager.clearManualAccount();
+					}
 					await accountManager.activateBestAccount();
 				})();
 			}
@@ -814,10 +865,22 @@ export function createStreamWrapper(
 			try {
 				const excludedEmails = new Set<string>();
 				for (let attempt = 0; attempt <= MAX_ROTATION_RETRIES; attempt++) {
-					const account = await accountManager.activateBestAccount({
+					const now = Date.now();
+					const manual = accountManager.getAvailableManualAccount({
 						excludeEmails: excludedEmails,
-						signal: options?.signal,
+						now,
 					});
+					const usingManual = Boolean(manual);
+					let account = manual;
+					if (!account) {
+						if (accountManager.hasManualAccount()) {
+							accountManager.clearManualAccount();
+						}
+						account = await accountManager.activateBestAccount({
+							excludeEmails: excludedEmails,
+							signal: options?.signal,
+						});
+					}
 					if (!account) {
 						throw new Error(
 							"No available Multicodex accounts. Please use /multicodex-login.",
@@ -862,6 +925,9 @@ export function createStreamWrapper(
 								await accountManager.handleQuotaExceeded(account, {
 									signal: options?.signal,
 								});
+								if (usingManual) {
+									accountManager.clearManualAccount();
+								}
 								excludedEmails.add(account.email);
 								abortController.abort();
 								retry = true;
