@@ -1,6 +1,6 @@
 {
 	"name": "pi-multicodex",
-	"version": "1.0.0",
+	"version": "1.0.1",
 	"description": "Rotate multiple ChatGPT Codex OAuth accounts for pi",
 	"license": "MIT",
 	"type": "module",
