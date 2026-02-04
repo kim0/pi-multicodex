@@ -177,6 +177,14 @@ export function getNextResetAt(usage?: CodexUsageSnapshot): number | undefined {
 	return Math.min(...candidates);
 }
 
+// Weekly reset only (secondary window)
+export function getWeeklyResetAt(
+	usage?: CodexUsageSnapshot,
+): number | undefined {
+	const resetAt = usage?.secondary?.resetAt;
+	return typeof resetAt === "number" ? resetAt : undefined;
+}
+
 function formatResetAt(resetAt?: number): string {
 	if (!resetAt) return "unknown";
 	const diffMs = resetAt - Date.now();
@@ -325,14 +333,14 @@ function pickRandomAccount(accounts: Account[]): Account | undefined {
 	return accounts[Math.floor(Math.random() * accounts.length)];
 }
 
-function pickEarliestResetAccount(
+function pickEarliestWeeklyResetAccount(
 	accounts: Account[],
 	usageByEmail: Map<string, CodexUsageSnapshot>,
 ): Account | undefined {
 	const candidates = accounts
 		.map((account) => ({
 			account,
-			resetAt: getNextResetAt(usageByEmail.get(account.email)),
+			resetAt: getWeeklyResetAt(usageByEmail.get(account.email)),
 		}))
 		.filter(
 			(entry): entry is { account: Account; resetAt: number } =>
@@ -365,13 +373,16 @@ export function pickBestAccount(
 
 	if (untouched.length > 0) {
 		return (
-			pickEarliestResetAccount(untouched, usageByEmail) ??
+			pickEarliestWeeklyResetAccount(untouched, usageByEmail) ??
 			pickRandomAccount(untouched)
 		);
 	}
 
-	const earliestReset = pickEarliestResetAccount(withUsage, usageByEmail);
-	if (earliestReset) return earliestReset;
+	const earliestWeeklyReset = pickEarliestWeeklyResetAccount(
+		withUsage,
+		usageByEmail,
+	);
+	if (earliestWeeklyReset) return earliestWeeklyReset;
 
 	return pickRandomAccount(available);
 }

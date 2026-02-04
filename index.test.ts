@@ -7,6 +7,7 @@ import {
 	createStreamWrapper,
 	getNextResetAt,
 	getOpenAICodexMirror,
+	getWeeklyResetAt,
 	isQuotaErrorMessage,
 	isUsageUntouched,
 	parseCodexUsageResponse,
@@ -133,6 +134,16 @@ describe("usage helpers", () => {
 			}),
 		).toBe(1000);
 	});
+
+	it("picks weekly reset from usage", () => {
+		expect(
+			getWeeklyResetAt({
+				primary: { resetAt: 2000 },
+				secondary: { resetAt: 1000 },
+				fetchedAt: 0,
+			}),
+		).toBe(1000);
+	});
 });
 
 describe("pickBestAccount", () => {
@@ -161,7 +172,7 @@ describe("pickBestAccount", () => {
 		expect(selected?.email).toBe("b");
 	});
 
-	it("prefers earliest reset when all accounts touched", () => {
+	it("prefers earliest weekly reset when all accounts touched", () => {
 		const accounts = [makeAccount("a"), makeAccount("b")];
 		const usage = new Map([
 			[
@@ -183,7 +194,32 @@ describe("pickBestAccount", () => {
 		]);
 
 		const selected = pickBestAccount(accounts, usage, { now: 0 });
-		expect(selected?.email).toBe("b");
+		expect(selected?.email).toBe("a");
+	});
+
+	it("ignores 5h reset and prefers earliest weekly reset", () => {
+		const accounts = [makeAccount("sh01"), makeAccount("hind")];
+		const usage = new Map([
+			[
+				"sh01",
+				{
+					primary: { usedPercent: 0, resetAt: 60 * 60 * 1000 },
+					secondary: { usedPercent: 9, resetAt: 5 * 24 * 60 * 60 * 1000 },
+					fetchedAt: 0,
+				},
+			],
+			[
+				"hind",
+				{
+					primary: { usedPercent: 24, resetAt: 55 * 60 * 1000 },
+					secondary: { usedPercent: 13, resetAt: 6 * 24 * 60 * 60 * 1000 },
+					fetchedAt: 0,
+				},
+			],
+		]);
+
+		const selected = pickBestAccount(accounts, usage, { now: 0 });
+		expect(selected?.email).toBe("sh01");
 	});
 
 	it("falls back to available account when usage is unknown", () => {

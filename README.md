@@ -8,7 +8,7 @@ The goal is to **maximize your usable Codex quota** across accounts:
 
 - **Automatic rotation on quota/rate-limit errors** (e.g. 429, usage limit).
 - **Avoids wasting quota on "untouched" accounts**: it prefers accounts that show *0% used* (so none sit unused until their window resets).
-- **Prefers accounts that reset sooner** when usage information is available (so you get back capacity sooner).
+- **Prefers accounts whose weekly quota resets sooner** when usage information is available (so you don't waste a weekly window).
 
 ## Install (recommended)
 
@@ -53,7 +53,7 @@ When pi starts / when a new session starts, the extension:
 2. Fetches usage info for each account (cached for a few minutes).
 3. Picks an account using these heuristics:
    - Prefer accounts that look **untouched** (0% used), so their quota doesn't go to waste.
-   - Otherwise prefer the account whose quota window **resets soonest**.
+   - Otherwise prefer the account whose **weekly** quota window **resets soonest**.
    - Otherwise pick a random available account.
 
 When streaming and a quota/rate-limit error happens **before any tokens are generated**, it:
