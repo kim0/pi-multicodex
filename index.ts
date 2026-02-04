@@ -37,6 +37,9 @@ import type {
 // Helpers
 // =============================================================================
 
+const USAGE_CACHE_TTL_MS = 5 * 60 * 1000;
+const USAGE_REQUEST_TIMEOUT_MS = 10 * 1000;
+
 export function isQuotaErrorMessage(message: string): boolean {
 	return /\b429\b|quota|usage limit|rate.?limit|too many requests|limit reached/i.test(
 		message,
@@ -72,6 +75,29 @@ function createErrorAssistantMessage(
 	};
 }
 
+interface CodexUsageWindow {
+	usedPercent?: number;
+	resetAt?: number;
+}
+
+export interface CodexUsageSnapshot {
+	primary?: CodexUsageWindow;
+	secondary?: CodexUsageWindow;
+	fetchedAt: number;
+}
+
+interface WhamUsageResponse {
+	rate_limit?: {
+		primary_window?: WhamUsageWindow;
+		secondary_window?: WhamUsageWindow;
+	};
+}
+
+type WhamUsageWindow = {
+	reset_at?: number;
+	used_percent?: number;
+};
+
 export interface ProviderModelDef {
 	id: string;
 	name: string;
@@ -106,6 +132,97 @@ export function getOpenAICodexMirror(): {
 	};
 }
 
+function normalizeUsedPercent(value?: number): number | undefined {
+	if (typeof value !== "number" || !Number.isFinite(value)) return undefined;
+	return Math.min(100, Math.max(0, value));
+}
+
+function normalizeResetAt(value?: number): number | undefined {
+	if (typeof value !== "number" || !Number.isFinite(value)) return undefined;
+	return value * 1000;
+}
+
+function parseUsageWindow(
+	window?: WhamUsageWindow,
+): CodexUsageWindow | undefined {
+	if (!window) return undefined;
+	const usedPercent = normalizeUsedPercent(window.used_percent);
+	const resetAt = normalizeResetAt(window.reset_at);
+	if (usedPercent === undefined && resetAt === undefined) return undefined;
+	return { usedPercent, resetAt };
+}
+
+export function parseCodexUsageResponse(
+	data: WhamUsageResponse,
+): Omit<CodexUsageSnapshot, "fetchedAt"> {
+	return {
+		primary: parseUsageWindow(data.rate_limit?.primary_window),
+		secondary: parseUsageWindow(data.rate_limit?.secondary_window),
+	};
+}
+
+export function isUsageUntouched(usage?: CodexUsageSnapshot): boolean {
+	const primary = usage?.primary?.usedPercent;
+	const secondary = usage?.secondary?.usedPercent;
+	if (primary === undefined || secondary === undefined) return false;
+	return primary === 0 && secondary === 0;
+}
+
+export function getNextResetAt(usage?: CodexUsageSnapshot): number | undefined {
+	const candidates = [
+		usage?.primary?.resetAt,
+		usage?.secondary?.resetAt,
+	].filter((value): value is number => typeof value === "number");
+	if (candidates.length === 0) return undefined;
+	return Math.min(...candidates);
+}
+
+function formatResetAt(resetAt?: number): string {
+	if (!resetAt) return "unknown";
+	const diffMs = resetAt - Date.now();
+	if (diffMs <= 0) return "now";
+	const diffMinutes = Math.max(1, Math.round(diffMs / 60000));
+	if (diffMinutes < 60) return `in ${diffMinutes}m`;
+	const diffHours = Math.round(diffMinutes / 60);
+	if (diffHours < 48) return `in ${diffHours}h`;
+	const diffDays = Math.round(diffHours / 24);
+	return `in ${diffDays}d`;
+}
+
+async function fetchCodexUsage(
+	accessToken: string,
+	accountId: string | undefined,
+	options?: { signal?: AbortSignal },
+): Promise<CodexUsageSnapshot> {
+	const { controller, clear } = createTimeoutController(
+		options?.signal,
+		USAGE_REQUEST_TIMEOUT_MS,
+	);
+	try {
+		const headers: Record<string, string> = {
+			Authorization: `Bearer ${accessToken}`,
+			Accept: "application/json",
+		};
+		if (accountId) {
+			headers["ChatGPT-Account-Id"] = accountId;
+		}
+
+		const response = await fetch("https://chatgpt.com/backend-api/wham/usage", {
+			headers,
+			signal: controller.signal,
+		});
+
+		if (!response.ok) {
+			throw new Error(`Usage request failed: ${response.status}`);
+		}
+
+		const data = (await response.json()) as WhamUsageResponse;
+		return { ...parseCodexUsageResponse(data), fetchedAt: Date.now() };
+	} finally {
+		clear();
+	}
+}
+
 function createLinkedAbortController(signal?: AbortSignal): AbortController {
 	const controller = new AbortController();
 	if (signal?.aborted) {
@@ -114,6 +231,18 @@ function createLinkedAbortController(signal?: AbortSignal): AbortController {
 	}
 	signal?.addEventListener("abort", () => controller.abort(), { once: true });
 	return controller;
+}
+
+function createTimeoutController(
+	signal: AbortSignal | undefined,
+	timeoutMs: number,
+): { controller: AbortController; clear: () => void } {
+	const controller = createLinkedAbortController(signal);
+	const timeout = setTimeout(() => controller.abort(), timeoutMs);
+	return {
+		controller,
+		clear: () => clearTimeout(timeout),
+	};
 }
 
 function withProvider(
@@ -166,11 +295,12 @@ async function openLoginInBrowser(
 // Storage
 // =============================================================================
 
-interface Account {
+export interface Account {
 	email: string;
 	accessToken: string;
 	refreshToken: string;
 	expiresAt: number;
+	accountId?: string;
 	lastUsed?: number;
 	quotaExhaustedUntil?: number;
 }
@@ -184,12 +314,76 @@ const STORAGE_FILE = path.join(os.homedir(), ".pi", "agent", "multicodex.json");
 const PROVIDER_ID = "multicodex";
 const QUOTA_COOLDOWN_MS = 60 * 60 * 1000; // 1 hour
 
+type WarningHandler = (message: string) => void;
+
+function isAccountAvailable(account: Account, now: number): boolean {
+	return !account.quotaExhaustedUntil || account.quotaExhaustedUntil <= now;
+}
+
+function pickRandomAccount(accounts: Account[]): Account | undefined {
+	if (accounts.length === 0) return undefined;
+	return accounts[Math.floor(Math.random() * accounts.length)];
+}
+
+function pickEarliestResetAccount(
+	accounts: Account[],
+	usageByEmail: Map<string, CodexUsageSnapshot>,
+): Account | undefined {
+	const candidates = accounts
+		.map((account) => ({
+			account,
+			resetAt: getNextResetAt(usageByEmail.get(account.email)),
+		}))
+		.filter(
+			(entry): entry is { account: Account; resetAt: number } =>
+				typeof entry.resetAt === "number",
+		)
+		.sort((a, b) => a.resetAt - b.resetAt);
+
+	return candidates[0]?.account;
+}
+
+export function pickBestAccount(
+	accounts: Account[],
+	usageByEmail: Map<string, CodexUsageSnapshot>,
+	options?: { excludeEmails?: Set<string>; now?: number },
+): Account | undefined {
+	const now = options?.now ?? Date.now();
+	const available = accounts.filter(
+		(account) =>
+			isAccountAvailable(account, now) &&
+			!options?.excludeEmails?.has(account.email),
+	);
+	if (available.length === 0) return undefined;
+
+	const withUsage = available.filter((account) =>
+		usageByEmail.has(account.email),
+	);
+	const untouched = withUsage.filter((account) =>
+		isUsageUntouched(usageByEmail.get(account.email)),
+	);
+
+	if (untouched.length > 0) {
+		return (
+			pickEarliestResetAccount(untouched, usageByEmail) ??
+			pickRandomAccount(untouched)
+		);
+	}
+
+	const earliestReset = pickEarliestResetAccount(withUsage, usageByEmail);
+	if (earliestReset) return earliestReset;
+
+	return pickRandomAccount(available);
+}
+
 // =============================================================================
 // Account Manager
 // =============================================================================
 
 export class AccountManager {
 	private data: StorageData;
+	private usageCache = new Map<string, CodexUsageSnapshot>();
+	private warningHandler?: WarningHandler;
 
 	constructor() {
 		this.data = this.load();
@@ -226,19 +420,28 @@ export class AccountManager {
 		return this.data.accounts.find((a) => a.email === email);
 	}
 
+	setWarningHandler(handler?: WarningHandler): void {
+		this.warningHandler = handler;
+	}
+
 	addOrUpdateAccount(email: string, creds: OAuthCredentials): void {
 		const existing = this.getAccount(email);
+		const accountId =
+			typeof creds.accountId === "string" ? creds.accountId : undefined;
 		if (existing) {
 			existing.accessToken = creds.access;
 			existing.refreshToken = creds.refresh;
 			existing.expiresAt = creds.expires;
-			existing.quotaExhaustedUntil = undefined;
+			if (accountId) {
+				existing.accountId = accountId;
+			}
 		} else {
 			this.data.accounts.push({
 				email,
 				accessToken: creds.access,
 				refreshToken: creds.refresh,
 				expiresAt: creds.expires,
+				accountId,
 			});
 		}
 		this.setActiveAccount(email);
@@ -246,59 +449,135 @@ export class AccountManager {
 	}
 
 	getActiveAccount(): Account | undefined {
-		// 1) Selected account (if not exhausted)
 		if (this.data.activeEmail) {
-			const account = this.getAccount(this.data.activeEmail);
-			if (
-				account &&
-				(!account.quotaExhaustedUntil ||
-					account.quotaExhaustedUntil < Date.now())
-			) {
-				return account;
-			}
+			return this.getAccount(this.data.activeEmail);
 		}
-
-		// 2) Any valid account
-		const valid = this.data.accounts.filter(
-			(a) => !a.quotaExhaustedUntil || a.quotaExhaustedUntil < Date.now(),
-		);
-		if (valid.length > 0) return valid[0];
-
-		// 3) All exhausted -> earliest cooldown expiry
-		if (this.data.accounts.length > 0) {
-			return [...this.data.accounts].sort(
-				(a, b) => (a.quotaExhaustedUntil || 0) - (b.quotaExhaustedUntil || 0),
-			)[0];
-		}
-
-		return undefined;
+		return this.data.accounts[0];
 	}
 
 	setActiveAccount(email: string): void {
-		if (this.getAccount(email)) {
-			this.data.activeEmail = email;
-			this.save();
-		}
+		const account = this.getAccount(email);
+		if (!account) return;
+		this.data.activeEmail = email;
+		account.lastUsed = Date.now();
+		this.save();
 	}
 
-	markExhausted(email: string): void {
+	markExhausted(email: string, until: number): void {
 		const account = this.getAccount(email);
 		if (account) {
-			account.quotaExhaustedUntil = Date.now() + QUOTA_COOLDOWN_MS;
+			account.quotaExhaustedUntil = until;
 			this.save();
 		}
 	}
 
-	rotateRandomly(): Account | undefined {
-		const available = this.data.accounts.filter(
-			(a) => !a.quotaExhaustedUntil || a.quotaExhaustedUntil < Date.now(),
-		);
-		if (available.length === 0) return this.getActiveAccount();
+	getCachedUsage(email: string): CodexUsageSnapshot | undefined {
+		return this.usageCache.get(email);
+	}
 
-		const random = available[Math.floor(Math.random() * available.length)];
-		this.data.activeEmail = random.email;
-		this.save();
-		return random;
+	async refreshUsageForAccount(
+		account: Account,
+		options?: { force?: boolean; signal?: AbortSignal },
+	): Promise<CodexUsageSnapshot | undefined> {
+		const cached = this.usageCache.get(account.email);
+		const now = Date.now();
+		if (
+			cached &&
+			!options?.force &&
+			now - cached.fetchedAt < USAGE_CACHE_TTL_MS
+		) {
+			return cached;
+		}
+
+		try {
+			const token = await this.ensureValidToken(account);
+			const usage = await fetchCodexUsage(token, account.accountId, {
+				signal: options?.signal,
+			});
+			this.usageCache.set(account.email, usage);
+			return usage;
+		} catch (error) {
+			this.warningHandler?.(
+				`Multicodex: failed to fetch usage for ${account.email}: ${getErrorMessage(
+					error,
+				)}`,
+			);
+			return undefined;
+		}
+	}
+
+	async refreshUsageForAllAccounts(options?: {
+		force?: boolean;
+		signal?: AbortSignal;
+	}): Promise<void> {
+		const accounts = this.getAccounts();
+		await Promise.all(
+			accounts.map((account) => this.refreshUsageForAccount(account, options)),
+		);
+	}
+
+	async refreshUsageIfStale(
+		accounts: Account[],
+		options?: { signal?: AbortSignal },
+	): Promise<void> {
+		const now = Date.now();
+		const stale = accounts.filter((account) => {
+			const cached = this.usageCache.get(account.email);
+			return !cached || now - cached.fetchedAt >= USAGE_CACHE_TTL_MS;
+		});
+		if (stale.length === 0) return;
+		await Promise.all(
+			stale.map((account) =>
+				this.refreshUsageForAccount(account, { force: true, ...options }),
+			),
+		);
+	}
+
+	async activateBestAccount(options?: {
+		excludeEmails?: Set<string>;
+		signal?: AbortSignal;
+	}): Promise<Account | undefined> {
+		const now = Date.now();
+		this.clearExpiredExhaustion(now);
+		const accounts = this.data.accounts;
+		await this.refreshUsageIfStale(accounts, options);
+
+		const selected = pickBestAccount(accounts, this.usageCache, {
+			excludeEmails: options?.excludeEmails,
+			now,
+		});
+		if (selected) {
+			this.setActiveAccount(selected.email);
+		}
+		return selected;
+	}
+
+	async handleQuotaExceeded(
+		account: Account,
+		options?: { signal?: AbortSignal },
+	): Promise<void> {
+		const usage = await this.refreshUsageForAccount(account, {
+			force: true,
+			signal: options?.signal,
+		});
+		const now = Date.now();
+		const resetAt = getNextResetAt(usage);
+		const fallback = now + QUOTA_COOLDOWN_MS;
+		const until = resetAt && resetAt > now ? resetAt : fallback;
+		this.markExhausted(account.email, until);
+	}
+
+	private clearExpiredExhaustion(now: number): void {
+		let changed = false;
+		for (const account of this.data.accounts) {
+			if (account.quotaExhaustedUntil && account.quotaExhaustedUntil <= now) {
+				account.quotaExhaustedUntil = undefined;
+				changed = true;
+			}
+		}
+		if (changed) {
+			this.save();
+		}
 	}
 
 	async ensureValidToken(account: Account): Promise<string> {
@@ -308,8 +587,16 @@ export class AccountManager {
 		}
 
 		const result = await refreshOpenAICodexToken(account.refreshToken);
-		this.addOrUpdateAccount(account.email, result);
-		return result.access;
+		account.accessToken = result.access;
+		account.refreshToken = result.refresh;
+		account.expiresAt = result.expires;
+		const accountId =
+			typeof result.accountId === "string" ? result.accountId : undefined;
+		if (accountId) {
+			account.accountId = accountId;
+		}
+		this.save();
+		return account.accessToken;
 	}
 }
 
@@ -348,6 +635,13 @@ export function buildMulticodexProviderConfig(accountManager: AccountManager): {
 
 export default function multicodexExtension(pi: ExtensionAPI) {
 	const accountManager = new AccountManager();
+	let lastContext: ExtensionContext | undefined;
+
+	accountManager.setWarningHandler((message) => {
+		if (lastContext) {
+			lastContext.ui.notify(message, "warning");
+		}
+	});
 
 	pi.registerProvider(
 		PROVIDER_ID,
@@ -431,6 +725,7 @@ export default function multicodexExtension(pi: ExtensionAPI) {
 			_args: string,
 			ctx: ExtensionCommandContext,
 		): Promise<void> => {
+			await accountManager.refreshUsageForAllAccounts();
 			const accounts = accountManager.getAccounts();
 			if (accounts.length === 0) {
 				ctx.ui.notify(
@@ -442,15 +737,32 @@ export default function multicodexExtension(pi: ExtensionAPI) {
 
 			const active = accountManager.getActiveAccount();
 			const options = accounts.map((account) => {
+				const usage = accountManager.getCachedUsage(account.email);
 				const isActive = active?.email === account.email;
 				const quotaHit =
 					account.quotaExhaustedUntil &&
 					account.quotaExhaustedUntil > Date.now();
-				const tags = [isActive ? "active" : null, quotaHit ? "quota" : null]
+				const untouched = isUsageUntouched(usage) ? "untouched" : null;
+				const tags = [
+					isActive ? "active" : null,
+					quotaHit ? "quota" : null,
+					untouched,
+				]
 					.filter(Boolean)
 					.join(", ");
 				const suffix = tags ? ` (${tags})` : "";
-				return `${isActive ? "•" : " "} ${account.email}${suffix}`;
+				const primaryUsed = usage?.primary?.usedPercent;
+				const secondaryUsed = usage?.secondary?.usedPercent;
+				const primaryReset = usage?.primary?.resetAt;
+				const secondaryReset = usage?.secondary?.resetAt;
+				const primaryLabel =
+					primaryUsed === undefined ? "unknown" : `${Math.round(primaryUsed)}%`;
+				const secondaryLabel =
+					secondaryUsed === undefined
+						? "unknown"
+						: `${Math.round(secondaryUsed)}%`;
+				const usageSummary = `5h ${primaryLabel} reset:${formatResetAt(primaryReset)} | weekly ${secondaryLabel} reset:${formatResetAt(secondaryReset)}`;
+				return `${isActive ? "•" : " "} ${account.email}${suffix} - ${usageSummary}`;
 			});
 
 			await ctx.ui.select("MultiCodex Accounts", options);
@@ -458,20 +770,24 @@ export default function multicodexExtension(pi: ExtensionAPI) {
 	});
 
 	// Hooks
-	pi.on("session_start", (_event: unknown, _ctx: ExtensionContext) => {
-		if (
-			!accountManager.getActiveAccount() &&
-			accountManager.getAccounts().length > 0
-		) {
-			accountManager.rotateRandomly();
-		}
+	pi.on("session_start", (_event: unknown, ctx: ExtensionContext) => {
+		lastContext = ctx;
+		if (accountManager.getAccounts().length === 0) return;
+		void (async () => {
+			await accountManager.refreshUsageForAllAccounts({ force: true });
+			await accountManager.activateBestAccount();
+		})();
 	});
 
 	pi.on(
 		"session_switch",
-		(event: { reason?: string }, _ctx: ExtensionContext) => {
+		(event: { reason?: string }, ctx: ExtensionContext) => {
+			lastContext = ctx;
 			if (event.reason === "new") {
-				accountManager.rotateRandomly();
+				void (async () => {
+					await accountManager.refreshUsageForAllAccounts({ force: true });
+					await accountManager.activateBestAccount();
+				})();
 			}
 		},
 	);
@@ -496,8 +812,12 @@ export function createStreamWrapper(
 
 		(async () => {
 			try {
+				const excludedEmails = new Set<string>();
 				for (let attempt = 0; attempt <= MAX_ROTATION_RETRIES; attempt++) {
-					const account = accountManager.getActiveAccount();
+					const account = await accountManager.activateBestAccount({
+						excludeEmails: excludedEmails,
+						signal: options?.signal,
+					});
 					if (!account) {
 						throw new Error(
 							"No available Multicodex accounts. Please use /multicodex-login.",
@@ -539,8 +859,10 @@ export function createStreamWrapper(
 							const isQuota = isQuotaErrorMessage(msg);
 
 							if (isQuota && !forwardedAny && attempt < MAX_ROTATION_RETRIES) {
-								accountManager.markExhausted(account.email);
-								accountManager.rotateRandomly();
+								await accountManager.handleQuotaExceeded(account, {
+									signal: options?.signal,
+								});
+								excludedEmails.add(account.email);
 								abortController.abort();
 								retry = true;
 								break;
